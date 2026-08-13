@@ -13,13 +13,24 @@
 #
 # Wire this in as the Laravel Cloud "Start command":
 #   bash scripts/laravel-cloud/startup-probe-shim.sh
-set -euo pipefail
+set -uo pipefail
 
 EXTERNAL_PORT="${SERVER_PORT:-3000}"
 INTERNAL_PORT="${STARTUP_PROBE_SHIM_INTERNAL_PORT:-18080}"
 POLL_INTERVAL="${STARTUP_PROBE_SHIM_POLL_INTERVAL:-2}"
 
+echo "[startup-probe-shim] pwd=$(pwd)"
+echo "[startup-probe-shim] target/: $(ls -la target 2>&1)"
+echo "[startup-probe-shim] build/libs/: $(ls -la build/libs 2>&1)"
+
 JAR="$(ls target/*.jar build/libs/*.jar 2>/dev/null | grep -v -- "-plain\.jar\$" | head -1)"
+if [ -z "${JAR}" ]; then
+    echo "[startup-probe-shim] FATAL: no runnable jar found under target/ or build/libs/ (see listing above)" >&2
+    exit 1
+fi
+echo "[startup-probe-shim] resolved jar: ${JAR}"
+
+set -e
 
 echo "[startup-probe-shim] starting Artemis on internal port ${INTERNAL_PORT}"
 SERVER_PORT="${INTERNAL_PORT}" java -jar "${JAR}" &
