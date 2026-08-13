@@ -1,12 +1,24 @@
 #!/usr/bin/env bash
-# Temporary workaround for Laravel Cloud's beta Java/Spring Boot support: its startup
-# probe kills the container ~15s after launch, long before Artemis (Liquibase +
-# Hibernate + Hazelcast) can finish booting. Laravel Cloud infra confirmed the fix is
-# to extend the probed port's uptime until Java is actually listening and ready.
+# Workaround for Laravel Cloud's beta Java/Spring Boot support: its health probe kills
+# the container ~15s after launch, long before Artemis (Liquibase + Hibernate +
+# Hazelcast) finishes booting. Laravel Cloud infra confirmed the fix is to keep the
+# probed port answering until Java is actually listening -- and that the probe runs
+# continuously, not just once during startup.
 #
-# This script does that: it starts Artemis on an internal port, answers the external
-# (probed) port with a decoy response until Artemis's own readiness endpoint reports
-# UP, then switches the external port over to a proxy in front of the real app.
+# Design: a single long-lived gateway owns the external (probed) port for the whole
+# life of the container. Artemis runs on an internal port. For each connection the
+# gateway tries the internal port; if Artemis is up it pipes the connection through,
+# and if it is not up yet it answers 200 OK itself. That means:
+#   * the probed port is bound within milliseconds of container start, and never
+#     unbound afterwards -- no handoff gap, and nothing to re-satisfy if the probe
+#     keeps running forever;
+#   * real traffic reaches Artemis as soon as it is listening, with no restart.
+#
+# The gateway binds dual-stack (:: with V6Only=0) where IO::Socket::IP is available.
+# An IPv4-only bind is not sufficient here: this environment is IPv6-native (nginx
+# logs clients such as 2600:1f16:e0:...), so a probe connecting over IPv6 or via a
+# localhost that resolves to ::1 would be refused by an 0.0.0.0-only listener even
+# though nginx, which dials 127.0.0.1, sees it as perfectly healthy.
 #
 # Not used by any other deployment path (docker/artemis/Dockerfile has its own
 # HEALTHCHECK with a 600s start-period and doesn't invoke this script).
@@ -17,7 +29,7 @@ set -uo pipefail
 
 EXTERNAL_PORT="${SERVER_PORT:-3000}"
 INTERNAL_PORT="${STARTUP_PROBE_SHIM_INTERNAL_PORT:-18080}"
-POLL_INTERVAL="${STARTUP_PROBE_SHIM_POLL_INTERVAL:-2}"
+POLL_INTERVAL="${STARTUP_PROBE_SHIM_POLL_INTERVAL:-5}"
 
 echo "[startup-probe-shim] pwd=$(pwd)"
 echo "[startup-probe-shim] target/: $(ls -la target 2>&1)"
@@ -30,150 +42,103 @@ if [ -z "${JAR}" ]; then
 fi
 echo "[startup-probe-shim] resolved jar: ${JAR}"
 
-set -e
-
-echo "[startup-probe-shim] starting Artemis on internal port ${INTERNAL_PORT}"
-SERVER_PORT="${INTERNAL_PORT}" java -jar "${JAR}" &
-JAVA_PID=$!
-
-is_ready() {
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsS -m 2 "http://127.0.0.1:${INTERNAL_PORT}/management/health/readiness" 2>/dev/null | grep -q '"UP"'
-        return $?
-    fi
-    # Fallback when curl isn't available: a raw HTTP GET over bash's /dev/tcp.
-    if ! exec 3<>"/dev/tcp/127.0.0.1/${INTERNAL_PORT}" 2>/dev/null; then
-        return 1
-    fi
-    printf 'GET /management/health/readiness HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3
-    local response
-    response="$(timeout 2 cat <&3 || true)"
-    exec 3<&- 3>&- 2>/dev/null || true
-    [[ "${response}" == *'"UP"'* ]]
-}
-
-# A one-shot "nc -l" cycled in a loop only listens for a single connection at a time;
-# between one nc process exiting and the next binding, the port isn't listening at
-# all, and anything landing in that gap (the startup probe, or real traffic) sees
-# "connection refused". Worse, if nc isn't even installed, that loop does nothing at
-# all while still claiming to via this script's own log line -- which is exactly what
-# happened on Laravel Cloud's runtime image (confirmed: no nc, no socat, no python3;
-# only perl). So: try real persistent-listener tools in order, and if none exist,
-# fail loudly instead of silently pretending to serve the port.
-DECOY_PID=""
-if command -v socat >/dev/null 2>&1; then
-    socat TCP-LISTEN:"${EXTERNAL_PORT}",fork,reuseaddr \
-        SYSTEM:'printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"' &
-    DECOY_PID=$!
-elif command -v perl >/dev/null 2>&1; then
+# ---------------------------------------------------------------------------
+# Gateway: bind the probed port first, before Java is even started, so the very
+# first probe lands on something that answers.
+# ---------------------------------------------------------------------------
+GATEWAY_PID=""
+if command -v perl >/dev/null 2>&1; then
     perl -e '
-        use IO::Socket::INET;
+        use strict;
+        use warnings;
         use IO::Select;
-        my $port = shift @ARGV;
-        my $server = IO::Socket::INET->new(LocalPort => $port, Listen => 128, Reuse => 1, Proto => "tcp")
-            or die "cannot bind $port: $!";
-        my $response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
-        while (my $client = $server->accept()) {
-            # Drain whatever request bytes are already arriving before responding: closing a
-            # socket with unread data still in its receive buffer sends a TCP RST instead of a
-            # clean FIN, which showed up as nginx logging "Connection reset by peer" upstream.
-            # Bounded to 0.2s in case this is a bare TCP-connect probe that never sends anything.
-            my $sel = IO::Select->new($client);
-            if ($sel->can_read(0.2)) {
-                my $buf;
-                $client->recv($buf, 8192);
-            }
-            print $client $response;
-            close $client;
-        }
-    ' "${EXTERNAL_PORT}" &
-    DECOY_PID=$!
-elif command -v python3 >/dev/null 2>&1; then
-    python3 - "${EXTERNAL_PORT}" <<'PYEOF' &
-import http.server, socketserver, sys
-
-PORT = int(sys.argv[1])
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Length", "2")
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-    def log_message(self, *args):
-        pass
-
-class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-
-Server(("0.0.0.0", PORT), Handler).serve_forever()
-PYEOF
-    DECOY_PID=$!
-elif command -v nc >/dev/null 2>&1; then
-    echo "[startup-probe-shim] WARNING: only nc found; falling back to a gappy nc-loop decoy" >&2
-    ( while true; do
-          printf 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK' \
-              | timeout "${POLL_INTERVAL}" nc -l -w "${POLL_INTERVAL}" "${EXTERNAL_PORT}" >/dev/null 2>&1 || true
-      done ) &
-    DECOY_PID=$!
-else
-    echo "[startup-probe-shim] FATAL: none of socat, perl, python3, nc are available to run a decoy listener on ${EXTERNAL_PORT}" >&2
-    kill "${JAVA_PID}" 2>/dev/null || true
-    exit 1
-fi
-echo "[startup-probe-shim] decoy listener (pid ${DECOY_PID}) serving ${EXTERNAL_PORT} until Artemis reports ready"
-
-while ! is_ready; do
-    if ! kill -0 "${JAVA_PID}" 2>/dev/null; then
-        echo "[startup-probe-shim] java process died before becoming ready, exiting"
-        kill "${DECOY_PID}" 2>/dev/null || true
-        exit 1
-    fi
-    sleep "${POLL_INTERVAL}"
-done
-
-echo "[startup-probe-shim] Artemis is ready, stopping decoy and switching ${EXTERNAL_PORT} -> ${INTERNAL_PORT} to a proxy"
-kill "${DECOY_PID}" 2>/dev/null || true
-wait "${DECOY_PID}" 2>/dev/null || true
-if command -v socat >/dev/null 2>&1; then
-    exec socat TCP-LISTEN:"${EXTERNAL_PORT}",fork,reuseaddr TCP:127.0.0.1:"${INTERNAL_PORT}"
-elif command -v perl >/dev/null 2>&1; then
-    exec perl -e '
-        use IO::Socket::INET;
-        use IO::Select;
+        use POSIX qw(:sys_wait_h);
 
         my ($listen_port, $target_port) = @ARGV;
-        my $server = IO::Socket::INET->new(LocalPort => $listen_port, Listen => 128, Reuse => 1, Proto => "tcp")
-            or die "cannot bind $listen_port: $!";
+        $| = 1;
+        $SIG{CHLD} = sub { 1 while waitpid(-1, WNOHANG) > 0 };
+        $SIG{PIPE} = "IGNORE";
 
-        while (my $client = $server->accept()) {
+        # Dual-stack where possible: an IPv4-only listener is invisible to a probe
+        # that connects over IPv6 or via a localhost resolving to ::1.
+        my $server;
+        if (eval { require IO::Socket::IP; 1 }) {
+            $server = IO::Socket::IP->new(
+                LocalHost => "::",
+                LocalPort => $listen_port,
+                Listen    => 128,
+                ReuseAddr => 1,
+                V6Only    => 0,
+            );
+            print STDERR "[gateway] bound $listen_port dual-stack (IO::Socket::IP)\n" if $server;
+        }
+        if (!$server) {
+            require IO::Socket::INET;
+            $server = IO::Socket::INET->new(
+                LocalPort => $listen_port,
+                Listen    => 128,
+                Reuse     => 1,
+                Proto     => "tcp",
+            ) or die "[gateway] FATAL: cannot bind $listen_port: $!\n";
+            print STDERR "[gateway] bound $listen_port IPv4-only (IO::Socket::IP unavailable)\n";
+        }
+        print STDERR "[gateway] upstream is 127.0.0.1:$target_port\n";
+
+        my $holding = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+
+        while (1) {
+            my $client = $server->accept();
+            next unless $client;
             my $pid = fork();
-            next unless defined $pid;
+            if (!defined $pid) { close $client; next; }
             if ($pid == 0) {
                 close $server;
-                my $upstream = IO::Socket::INET->new(PeerAddr => "127.0.0.1", PeerPort => $target_port, Proto => "tcp");
-                if (!$upstream) { close $client; exit(0); }
-                my $sel = IO::Select->new($client, $upstream);
-                while (my @ready = $sel->can_read) {
+                require IO::Socket::INET;
+                my $up = IO::Socket::INET->new(
+                    PeerAddr => "127.0.0.1",
+                    PeerPort => $target_port,
+                    Proto    => "tcp",
+                    Timeout  => 2,
+                );
+                if (!$up) {
+                    # Artemis is not listening yet: answer the probe ourselves. Drain
+                    # first, so closing does not leave unread bytes in the receive
+                    # buffer (which makes the kernel send RST instead of FIN).
+                    my $s = IO::Select->new($client);
+                    if ($s->can_read(0.2)) { my $b; sysread($client, $b, 8192); }
+                    syswrite($client, $holding);
+                    close $client;
+                    exit 0;
+                }
+                my $sel = IO::Select->new($client, $up);
+                OUTER: while (my @ready = $sel->can_read()) {
                     for my $fh (@ready) {
                         my $buf;
                         my $n = sysread($fh, $buf, 65536);
-                        if (!defined $n || $n == 0) { close $client; close $upstream; exit(0); }
-                        my $out = ($fh == $client) ? $upstream : $client;
-                        syswrite($out, $buf);
+                        last OUTER if !defined $n || $n == 0;
+                        my $out = (fileno($fh) == fileno($client)) ? $up : $client;
+                        my $off = 0;
+                        while ($off < length($buf)) {
+                            my $w = syswrite($out, $buf, length($buf) - $off, $off);
+                            last OUTER if !defined $w;
+                            $off += $w;
+                        }
                     }
                 }
-                exit(0);
+                close $client;
+                close $up;
+                exit 0;
             }
             close $client;
         }
-    ' "${EXTERNAL_PORT}" "${INTERNAL_PORT}"
+    ' "${EXTERNAL_PORT}" "${INTERNAL_PORT}" &
+    GATEWAY_PID=$!
 elif command -v python3 >/dev/null 2>&1; then
-    exec python3 - "${EXTERNAL_PORT}" "${INTERNAL_PORT}" <<'PYEOF'
-import asyncio, sys
+    python3 - "${EXTERNAL_PORT}" "${INTERNAL_PORT}" <<'PYEOF' &
+import asyncio, socket, sys
+
 EXTERNAL_PORT, INTERNAL_PORT = int(sys.argv[1]), int(sys.argv[2])
+HOLDING = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
 
 async def pipe(a, b):
     try:
@@ -183,26 +148,79 @@ async def pipe(a, b):
                 break
             b.write(data)
             await b.drain()
+    except Exception:
+        pass
     finally:
-        b.close()
+        try:
+            b.close()
+        except Exception:
+            pass
 
 async def handle(reader, writer):
     try:
         r2, w2 = await asyncio.open_connection("127.0.0.1", INTERNAL_PORT)
     except Exception:
+        # Upstream not up yet: answer the probe ourselves, draining first.
+        try:
+            await asyncio.wait_for(reader.read(8192), timeout=0.2)
+        except Exception:
+            pass
+        writer.write(HOLDING)
+        try:
+            await writer.drain()
+        except Exception:
+            pass
         writer.close()
         return
     await asyncio.gather(pipe(reader, w2), pipe(r2, writer))
 
 async def main():
-    server = await asyncio.start_server(handle, "0.0.0.0", EXTERNAL_PORT)
+    # host=None binds every available interface, which yields a dual-stack listener
+    # on an IPv6-enabled host -- the point being not to end up IPv4-only.
+    server = await asyncio.start_server(handle, None, EXTERNAL_PORT)
+    print(f"[gateway] listening on {EXTERNAL_PORT}, upstream 127.0.0.1:{INTERNAL_PORT}", file=sys.stderr, flush=True)
     async with server:
         await server.serve_forever()
 
 asyncio.run(main())
 PYEOF
+    GATEWAY_PID=$!
 else
-    echo "[startup-probe-shim] FATAL: none of socat, perl, python3 are available to proxy ${EXTERNAL_PORT} -> ${INTERNAL_PORT}; the app is only reachable on ${INTERNAL_PORT}" >&2
-    kill "${JAVA_PID}" 2>/dev/null || true
+    echo "[startup-probe-shim] FATAL: neither perl nor python3 is available to run the gateway on ${EXTERNAL_PORT}" >&2
     exit 1
 fi
+echo "[startup-probe-shim] gateway (pid ${GATEWAY_PID}) owns ${EXTERNAL_PORT}, forwarding to ${INTERNAL_PORT} once Artemis is up"
+
+# ---------------------------------------------------------------------------
+# Artemis itself, on the internal port.
+# ---------------------------------------------------------------------------
+echo "[startup-probe-shim] starting Artemis on internal port ${INTERNAL_PORT}"
+SERVER_PORT="${INTERNAL_PORT}" java -jar "${JAR}" &
+JAVA_PID=$!
+
+cleanup() {
+    kill "${GATEWAY_PID}" 2>/dev/null || true
+    kill "${JAVA_PID}" 2>/dev/null || true
+}
+trap cleanup TERM INT
+
+# Observability only: report the moment Artemis starts accepting, so the logs show
+# how long a full boot actually takes here.
+(
+    start="${SECONDS}"
+    while true; do
+        if (exec 3<>"/dev/tcp/127.0.0.1/${INTERNAL_PORT}") 2>/dev/null; then
+            exec 3<&- 3>&- 2>/dev/null || true
+            echo "[startup-probe-shim] Artemis is accepting on ${INTERNAL_PORT} after $((SECONDS - start))s; gateway now forwarding real traffic"
+            break
+        fi
+        kill -0 "${JAVA_PID}" 2>/dev/null || break
+        sleep "${POLL_INTERVAL}"
+    done
+) &
+
+wait "${JAVA_PID}"
+JAVA_STATUS=$?
+echo "[startup-probe-shim] java exited with status ${JAVA_STATUS}; shutting down gateway"
+kill "${GATEWAY_PID}" 2>/dev/null || true
+exit "${JAVA_STATUS}"
