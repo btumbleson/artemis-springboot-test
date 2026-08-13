@@ -68,11 +68,21 @@ if command -v socat >/dev/null 2>&1; then
 elif command -v perl >/dev/null 2>&1; then
     perl -e '
         use IO::Socket::INET;
+        use IO::Select;
         my $port = shift @ARGV;
         my $server = IO::Socket::INET->new(LocalPort => $port, Listen => 128, Reuse => 1, Proto => "tcp")
             or die "cannot bind $port: $!";
         my $response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
         while (my $client = $server->accept()) {
+            # Drain whatever request bytes are already arriving before responding: closing a
+            # socket with unread data still in its receive buffer sends a TCP RST instead of a
+            # clean FIN, which showed up as nginx logging "Connection reset by peer" upstream.
+            # Bounded to 0.2s in case this is a bare TCP-connect probe that never sends anything.
+            my $sel = IO::Select->new($client);
+            if ($sel->can_read(0.2)) {
+                my $buf;
+                $client->recv($buf, 8192);
+            }
             print $client $response;
             close $client;
         }
