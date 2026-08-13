@@ -55,12 +55,28 @@ is_ready() {
 # A one-shot "nc -l" cycled in a loop only listens for a single connection at a time;
 # between one nc process exiting and the next binding, the port isn't listening at
 # all, and anything landing in that gap (the startup probe, or real traffic) sees
-# "connection refused". Run one continuously-listening decoy for the whole wait
-# instead, using the same tool preference as the post-ready proxy below.
+# "connection refused". Worse, if nc isn't even installed, that loop does nothing at
+# all while still claiming to via this script's own log line -- which is exactly what
+# happened on Laravel Cloud's runtime image (confirmed: no nc, no socat, no python3;
+# only perl). So: try real persistent-listener tools in order, and if none exist,
+# fail loudly instead of silently pretending to serve the port.
 DECOY_PID=""
 if command -v socat >/dev/null 2>&1; then
     socat TCP-LISTEN:"${EXTERNAL_PORT}",fork,reuseaddr \
         SYSTEM:'printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"' &
+    DECOY_PID=$!
+elif command -v perl >/dev/null 2>&1; then
+    perl -e '
+        use IO::Socket::INET;
+        my $port = shift @ARGV;
+        my $server = IO::Socket::INET->new(LocalPort => $port, Listen => 128, Reuse => 1, Proto => "tcp")
+            or die "cannot bind $port: $!";
+        my $response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+        while (my $client = $server->accept()) {
+            print $client $response;
+            close $client;
+        }
+    ' "${EXTERNAL_PORT}" &
     DECOY_PID=$!
 elif command -v python3 >/dev/null 2>&1; then
     python3 - "${EXTERNAL_PORT}" <<'PYEOF' &
@@ -85,13 +101,17 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 Server(("0.0.0.0", PORT), Handler).serve_forever()
 PYEOF
     DECOY_PID=$!
-else
-    echo "[startup-probe-shim] WARNING: no socat or python3 found; falling back to a gappy nc-loop decoy" >&2
+elif command -v nc >/dev/null 2>&1; then
+    echo "[startup-probe-shim] WARNING: only nc found; falling back to a gappy nc-loop decoy" >&2
     ( while true; do
           printf 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK' \
               | timeout "${POLL_INTERVAL}" nc -l -w "${POLL_INTERVAL}" "${EXTERNAL_PORT}" >/dev/null 2>&1 || true
       done ) &
     DECOY_PID=$!
+else
+    echo "[startup-probe-shim] FATAL: none of socat, perl, python3, nc are available to run a decoy listener on ${EXTERNAL_PORT}" >&2
+    kill "${JAVA_PID}" 2>/dev/null || true
+    exit 1
 fi
 echo "[startup-probe-shim] decoy listener (pid ${DECOY_PID}) serving ${EXTERNAL_PORT} until Artemis reports ready"
 
@@ -109,6 +129,37 @@ kill "${DECOY_PID}" 2>/dev/null || true
 wait "${DECOY_PID}" 2>/dev/null || true
 if command -v socat >/dev/null 2>&1; then
     exec socat TCP-LISTEN:"${EXTERNAL_PORT}",fork,reuseaddr TCP:127.0.0.1:"${INTERNAL_PORT}"
+elif command -v perl >/dev/null 2>&1; then
+    exec perl -e '
+        use IO::Socket::INET;
+        use IO::Select;
+
+        my ($listen_port, $target_port) = @ARGV;
+        my $server = IO::Socket::INET->new(LocalPort => $listen_port, Listen => 128, Reuse => 1, Proto => "tcp")
+            or die "cannot bind $listen_port: $!";
+
+        while (my $client = $server->accept()) {
+            my $pid = fork();
+            next unless defined $pid;
+            if ($pid == 0) {
+                close $server;
+                my $upstream = IO::Socket::INET->new(PeerAddr => "127.0.0.1", PeerPort => $target_port, Proto => "tcp");
+                if (!$upstream) { close $client; exit(0); }
+                my $sel = IO::Select->new($client, $upstream);
+                while (my @ready = $sel->can_read) {
+                    for my $fh (@ready) {
+                        my $buf;
+                        my $n = sysread($fh, $buf, 65536);
+                        if (!defined $n || $n == 0) { close $client; close $upstream; exit(0); }
+                        my $out = ($fh == $client) ? $upstream : $client;
+                        syswrite($out, $buf);
+                    }
+                }
+                exit(0);
+            }
+            close $client;
+        }
+    ' "${EXTERNAL_PORT}" "${INTERNAL_PORT}"
 elif command -v python3 >/dev/null 2>&1; then
     exec python3 - "${EXTERNAL_PORT}" "${INTERNAL_PORT}" <<'PYEOF'
 import asyncio, sys
@@ -141,6 +192,7 @@ async def main():
 asyncio.run(main())
 PYEOF
 else
-    echo "[startup-probe-shim] no socat or python3 available to proxy ${EXTERNAL_PORT} -> ${INTERNAL_PORT}; the app will only be reachable on ${INTERNAL_PORT}" >&2
-    wait "${JAVA_PID}"
+    echo "[startup-probe-shim] FATAL: none of socat, perl, python3 are available to proxy ${EXTERNAL_PORT} -> ${INTERNAL_PORT}; the app is only reachable on ${INTERNAL_PORT}" >&2
+    kill "${JAVA_PID}" 2>/dev/null || true
+    exit 1
 fi
