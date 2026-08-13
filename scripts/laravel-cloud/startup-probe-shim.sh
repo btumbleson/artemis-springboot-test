@@ -52,17 +52,61 @@ is_ready() {
     [[ "${response}" == *'"UP"'* ]]
 }
 
-echo "[startup-probe-shim] serving decoy responses on ${EXTERNAL_PORT} until Artemis reports ready"
+# A one-shot "nc -l" cycled in a loop only listens for a single connection at a time;
+# between one nc process exiting and the next binding, the port isn't listening at
+# all, and anything landing in that gap (the startup probe, or real traffic) sees
+# "connection refused". Run one continuously-listening decoy for the whole wait
+# instead, using the same tool preference as the post-ready proxy below.
+DECOY_PID=""
+if command -v socat >/dev/null 2>&1; then
+    socat TCP-LISTEN:"${EXTERNAL_PORT}",fork,reuseaddr \
+        SYSTEM:'printf "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"' &
+    DECOY_PID=$!
+elif command -v python3 >/dev/null 2>&1; then
+    python3 - "${EXTERNAL_PORT}" <<'PYEOF' &
+import http.server, socketserver, sys
+
+PORT = int(sys.argv[1])
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, *args):
+        pass
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+Server(("0.0.0.0", PORT), Handler).serve_forever()
+PYEOF
+    DECOY_PID=$!
+else
+    echo "[startup-probe-shim] WARNING: no socat or python3 found; falling back to a gappy nc-loop decoy" >&2
+    ( while true; do
+          printf 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK' \
+              | timeout "${POLL_INTERVAL}" nc -l -w "${POLL_INTERVAL}" "${EXTERNAL_PORT}" >/dev/null 2>&1 || true
+      done ) &
+    DECOY_PID=$!
+fi
+echo "[startup-probe-shim] decoy listener (pid ${DECOY_PID}) serving ${EXTERNAL_PORT} until Artemis reports ready"
+
 while ! is_ready; do
     if ! kill -0 "${JAVA_PID}" 2>/dev/null; then
         echo "[startup-probe-shim] java process died before becoming ready, exiting"
+        kill "${DECOY_PID}" 2>/dev/null || true
         exit 1
     fi
-    printf 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK' \
-        | timeout "${POLL_INTERVAL}" nc -l -w "${POLL_INTERVAL}" "${EXTERNAL_PORT}" >/dev/null 2>&1 || true
+    sleep "${POLL_INTERVAL}"
 done
 
-echo "[startup-probe-shim] Artemis is ready, switching ${EXTERNAL_PORT} -> ${INTERNAL_PORT} to a proxy"
+echo "[startup-probe-shim] Artemis is ready, stopping decoy and switching ${EXTERNAL_PORT} -> ${INTERNAL_PORT} to a proxy"
+kill "${DECOY_PID}" 2>/dev/null || true
+wait "${DECOY_PID}" 2>/dev/null || true
 if command -v socat >/dev/null 2>&1; then
     exec socat TCP-LISTEN:"${EXTERNAL_PORT}",fork,reuseaddr TCP:127.0.0.1:"${INTERNAL_PORT}"
 elif command -v python3 >/dev/null 2>&1; then
